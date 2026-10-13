@@ -1,0 +1,68 @@
+# Simulates an AWS Application Load Balancer + Auto Scaling Group with Docker.
+name: lb-lab
+
+services:
+  # "Launch template": one image, scaled to N replicas (EC2 instances)
+  app:
+    build: ./app
+    image: lb-lab-app:latest
+    restart: unless-stopped
+    scale: 1                 # starting capacity; the autoscaler changes this
+    cpus: 0.5                # "instance size": each replica gets half a CPU
+    networks:
+      - lb-net
+    # No "ports:" -> instances are private, reachable only via the load balancer
+
+  # "Application Load Balancer"
+  load-balancer:
+    image: nginx:1.27-alpine
+    container_name: load-balancer
+    restart: unless-stopped
+    ports:
+      - "8080:80"            # the only public entry point
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - lb-net
+    depends_on:
+      app:
+        condition: service_healthy
+
+  # "Auto Scaling Group + CloudWatch alarm"
+  autoscaler:
+    build: ./autoscaler
+    image: lb-lab-autoscaler:latest
+    container_name: autoscaler
+    restart: unless-stopped
+    environment:
+      COMPOSE_PROJECT: lb-lab
+      SCALE_SERVICE: app
+      COMPOSE_FILE_PATH: /project/docker-compose.yml
+      MIN_REPLICAS: 1
+      MAX_REPLICAS: 6
+      SCALE_OUT_CPU: 60      # scale out when avg CPU > 60% ...
+      SCALE_OUT_PERIODS: 3   # ... for 3 consecutive checks
+      SCALE_IN_CPU: 20       # scale in when avg CPU < 20% ...
+      SCALE_IN_PERIODS: 6    # ... for 6 consecutive checks
+      CHECK_INTERVAL: 5      # seconds between checks
+      COOLDOWN: 30           # seconds to wait after a scaling action
+    volumes:
+      # WARNING: the Docker socket gives this container full control of Docker
+      # on the host. Fine for a local lab; never do this in production.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/project:ro
+    depends_on:
+      - load-balancer
+
+  # Load generator (only runs on demand: docker compose --profile load run --rm loadgen)
+  loadgen:
+    image: williamyeh/hey:latest
+    profiles: ["load"]
+    networks:
+      - lb-net
+    # 10 workers x 3 req/s = 30 req/s of 50ms CPU work ~= 1.5 CPUs of demand
+    command: ["-z", "180s", "-c", "10", "-q", "3", "http://load-balancer/work?ms=50"]
+
+networks:
+  lb-net:
+    driver: bridge
